@@ -1,5 +1,15 @@
 # Unreleased
 
+* Add `immutable_cache_prefixes` option for cross-worktree compile cache sharing.
+  Files under configured path prefixes (e.g. `/nix/store/`) are treated as immutable:
+  on cache hit, bootsnap skips opening and stat'ing the source file entirely, saving
+  2–3 syscalls per file. This enables multiple worktrees using the same nix-provided
+  gems to share a single warm compile cache.
+  - API: `Bootsnap.setup(immutable_cache_prefixes: { "/nix/store/" => "~/.cache/bootsnap/nix" })`
+  - Env: `BOOTSNAP_IMMUTABLE_CACHE_PREFIXES="/nix/store/=$HOME/.cache/bootsnap/nix"`
+  - **Warning:** Only use for paths that are truly immutable at the filesystem level.
+    Mutable paths will cause stale compiled code to be served indefinitely.
+
 # 1.23.0
 
 * Require Ruby 2.7.

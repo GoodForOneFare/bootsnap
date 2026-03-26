@@ -15,3 +15,6 @@
 *.db
 mkmf.log
 .rubocop-*
+vendor/
+ext/bootsnap/Makefile
+ext/bootsnap/*.dSYM/

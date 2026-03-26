@@ -2,14 +2,19 @@
 
 module Bootsnap
   module CompileCache
-    UNCOMPILABLE = BasicObject.new
-    def UNCOMPILABLE.inspect
-      "<Bootsnap::UNCOMPILABLE>"
+    # Reuse the sentinel created by the C extension if it was loaded first
+    # (e.g. via BootLib::Require.from_gem). The C side compares by object
+    # identity, so both sides must reference the same object.
+    unless const_defined?(:UNCOMPILABLE)
+      UNCOMPILABLE = BasicObject.new
+      def UNCOMPILABLE.inspect
+        "<Bootsnap::UNCOMPILABLE>"
+      end
     end
 
     Error = Class.new(StandardError)
 
-    def self.setup(cache_dir:, iseq:, yaml:, json: (json_unset = true), readonly: false, revalidation: false)
+    def self.setup(cache_dir:, iseq:, yaml:, json: (json_unset = true), readonly: false, revalidation: false, immutable_cache_prefixes: nil)
       unless json_unset
         warn("Bootsnap::CompileCache.setup `json` argument is deprecated and has no effect")
       end
@@ -17,7 +22,7 @@ module Bootsnap
       if iseq
         if supported?
           require_relative "compile_cache/iseq"
-          Bootsnap::CompileCache::ISeq.install!(cache_dir)
+          Bootsnap::CompileCache::ISeq.install!(cache_dir, immutable_cache_prefixes: immutable_cache_prefixes)
         elsif $VERBOSE
           warn("[bootsnap/setup] bytecode caching is not supported on this implementation of Ruby")
         end
@@ -26,7 +31,7 @@ module Bootsnap
       if yaml
         if supported?
           require_relative "compile_cache/yaml"
-          Bootsnap::CompileCache::YAML.install!(cache_dir)
+          Bootsnap::CompileCache::YAML.install!(cache_dir, immutable_cache_prefixes: immutable_cache_prefixes)
         elsif $VERBOSE
           warn("[bootsnap/setup] YAML parsing caching is not supported on this implementation of Ruby")
         end

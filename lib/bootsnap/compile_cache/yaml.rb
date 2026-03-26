@@ -23,9 +23,47 @@ module Bootsnap
           @cache_dir = cache_dir.end_with?("/") ? "#{cache_dir}yaml" : "#{cache_dir}-yaml"
         end
 
+        # Set immutable cache prefixes for YAML compile cache.
+        # WARNING: Paths under these prefixes are treated as immutable —
+        # source files will not be stat'd or opened on cache hit.
+        # See ISeq.immutable_cache_prefixes= for the full contract.
+        def immutable_cache_prefixes=(prefixes)
+          if prefixes && !prefixes.empty?
+            @immutable_cache_prefixes = prefixes.sort_by { |k, _| -k.length }.map do |prefix, dir|
+              prefix = File.expand_path(prefix)
+              prefix = "#{prefix}/" unless prefix.end_with?("/")
+              dir = File.expand_path(dir)
+              cache = dir.end_with?("/") ? "#{dir}yaml" : "#{dir}/yaml"
+              [prefix.freeze, cache.freeze]
+            end.freeze
+          else
+            @immutable_cache_prefixes = nil
+          end
+        end
+
+        # Returns [cache_dir, immutable]
+        def cache_dir_for(path)
+          if @immutable_cache_prefixes
+            @immutable_cache_prefixes.each do |prefix, dir|
+              return [dir, true] if path.start_with?(prefix)
+            end
+          end
+          [@cache_dir, false]
+        end
+
+        def fetch(path, handler, kwargs)
+          cache_dir, immutable = cache_dir_for(path)
+          if immutable
+            CompileCache::Native.fetch_immutable(cache_dir, path, handler, kwargs)
+          else
+            CompileCache::Native.fetch(cache_dir, path, handler, kwargs)
+          end
+        end
+
         def precompile(path)
           return false unless CompileCache::YAML.supported_internal_encoding?
 
+          cache_dir, _immutable = cache_dir_for(path.to_s)
           CompileCache::Native.precompile(
             cache_dir,
             path.to_s,
@@ -33,8 +71,9 @@ module Bootsnap
           )
         end
 
-        def install!(cache_dir)
+        def install!(cache_dir, immutable_cache_prefixes: nil)
           self.cache_dir = cache_dir
+          self.immutable_cache_prefixes = immutable_cache_prefixes
           init!
           ::YAML.singleton_class.prepend(@implementation::Patch)
         end
@@ -231,12 +270,8 @@ module Bootsnap
               return super unless (kwargs.keys - CompileCache::YAML.supported_options).empty?
             end
 
-            CompileCache::Native.fetch(
-              CompileCache::YAML.cache_dir,
-              File.realpath(path),
-              CompileCache::YAML::Psych4::SafeLoad,
-              kwargs,
-            )
+            realpath = File.realpath(path)
+            CompileCache::YAML.fetch(realpath, CompileCache::YAML::Psych4::SafeLoad, kwargs)
           end
 
           ruby2_keywords :load_file if respond_to?(:ruby2_keywords, true)
@@ -251,12 +286,8 @@ module Bootsnap
               return super unless (kwargs.keys - CompileCache::YAML.supported_options).empty?
             end
 
-            CompileCache::Native.fetch(
-              CompileCache::YAML.cache_dir,
-              File.realpath(path),
-              CompileCache::YAML::Psych4::UnsafeLoad,
-              kwargs,
-            )
+            realpath = File.realpath(path)
+            CompileCache::YAML.fetch(realpath, CompileCache::YAML::Psych4::UnsafeLoad, kwargs)
           end
 
           ruby2_keywords :unsafe_load_file if respond_to?(:ruby2_keywords, true)
@@ -303,12 +334,8 @@ module Bootsnap
               return super unless (kwargs.keys - CompileCache::YAML.supported_options).empty?
             end
 
-            CompileCache::Native.fetch(
-              CompileCache::YAML.cache_dir,
-              File.realpath(path),
-              CompileCache::YAML::Psych3,
-              kwargs,
-            )
+            realpath = File.realpath(path)
+            CompileCache::YAML.fetch(realpath, CompileCache::YAML::Psych3, kwargs)
           end
 
           ruby2_keywords :load_file if respond_to?(:ruby2_keywords, true)
@@ -323,12 +350,8 @@ module Bootsnap
               return super unless (kwargs.keys - CompileCache::YAML.supported_options).empty?
             end
 
-            CompileCache::Native.fetch(
-              CompileCache::YAML.cache_dir,
-              File.realpath(path),
-              CompileCache::YAML::Psych3,
-              kwargs,
-            )
+            realpath = File.realpath(path)
+            CompileCache::YAML.fetch(realpath, CompileCache::YAML::Psych3, kwargs)
           end
 
           ruby2_keywords :unsafe_load_file if respond_to?(:ruby2_keywords, true)

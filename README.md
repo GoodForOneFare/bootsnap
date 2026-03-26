@@ -58,6 +58,9 @@ Bootsnap.setup(
   compile_cache_iseq:   true,                 # Compile Ruby code into ISeq cache, breaks coverage reporting.
   compile_cache_yaml:   true,                 # Compile YAML into a cache
   readonly:             true,                 # Use the caches but don't update them on miss or stale entries.
+  immutable_cache_prefixes: {                 # Optional: path prefixes with immutable source files.
+    '/nix/store/' => '~/.cache/bootsnap/nix'  # Tilde paths are expanded automatically.
+  },
 )
 ```
 
@@ -78,6 +81,10 @@ well together.
 - `DISABLE_BOOTSNAP` allows to entirely disable bootsnap.
 - `DISABLE_BOOTSNAP_LOAD_PATH_CACHE` allows to disable load path caching.
 - `DISABLE_BOOTSNAP_COMPILE_CACHE` allows to disable ISeq and YAML caches.
+- `BOOTSNAP_IMMUTABLE_CACHE_PREFIXES` maps immutable path prefixes to shared cache directories.
+  Format: `prefix=cache_dir;prefix2=cache_dir2`. Files under these prefixes are never stat'd on
+  cache hit, and the cache can be shared across worktrees. Only use for truly immutable paths
+  (e.g. `/nix/store/`). Example: `BOOTSNAP_IMMUTABLE_CACHE_PREFIXES="/nix/store/=$HOME/.cache/bootsnap/nix"`
 - `BOOTSNAP_READONLY` configure bootsnap to not update the cache on miss or stale entries.
 - `BOOTSNAP_LOG` configure bootsnap to log all caches misses to STDERR.
 - `BOOTSNAP_STATS` log hit rate statistics on exit. Can't be used if `BOOTSNAP_LOG` is enabled.

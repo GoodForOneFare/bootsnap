@@ -102,6 +102,7 @@ static mode_t current_umask;
 static VALUE rb_mBootsnap;
 static VALUE rb_mBootsnap_CompileCache_Native;
 static VALUE rb_cBootsnap_CompileCache_UNCOMPILABLE;
+static VALUE rb_cBootsnap_ImmutablePack;
 static ID instrumentation_method;
 static VALUE sym_hit, sym_miss, sym_stale, sym_revalidated;
 static bool instrumentation_enabled = false;
@@ -115,7 +116,57 @@ static VALUE bs_readonly_set(VALUE self, VALUE enabled);
 static VALUE bs_revalidation_set(VALUE self, VALUE enabled);
 static VALUE bs_compile_option_crc32_set(VALUE self, VALUE crc32_v);
 static VALUE bs_rb_fetch(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler, VALUE args);
+static VALUE bs_rb_fetch_immutable(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler, VALUE args);
 static VALUE bs_rb_precompile(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler);
+
+/* ======= Immutable Pack File ======= */
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
+
+#ifndef _WIN32
+#define IMMUTABLE_PACK_MAGIC "BSPC"
+#define IMMUTABLE_PACK_FORMAT 1
+
+struct __attribute__((packed)) bs_pack_header {
+  char     magic[4];         /* "BSPC" */
+  uint32_t format_version;   /* 1 */
+  uint32_t ruby_platform;
+  uint32_t compile_option;
+  uint32_t ruby_revision;
+  uint32_t entry_count;
+  uint32_t reserved;         /* 0, pad to 28 bytes */
+  uint32_t reserved2;        /* 0, pad to 32 bytes */
+};
+
+struct __attribute__((packed)) bs_pack_entry {
+  uint64_t path_hash;   /* FNV-1a of source path */
+  uint64_t data_offset; /* byte offset from start of file */
+  uint64_t data_size;
+};
+
+struct bs_immutable_pack {
+  void    *mapped;
+  size_t   mapped_size;
+  const struct bs_pack_header *header;
+  const struct bs_pack_entry  *index;
+  uint32_t entry_count;
+  int      valid;
+};
+
+STATIC_ASSERT(sizeof(struct bs_pack_header) == 32);
+STATIC_ASSERT(sizeof(struct bs_pack_entry) == 24);
+
+static void bs_pack_free(void *ptr);
+static size_t bs_pack_memsize(const void *ptr);
+static VALUE bs_rb_load_immutable_pack(VALUE self, VALUE path_v);
+static VALUE bs_rb_fetch_from_immutable_pack(VALUE self, VALUE pack_v, VALUE path_v, VALUE handler, VALUE args);
+#endif /* !_WIN32 */
+
+/* Forward declarations needed by pack implementation */
+static uint64_t fnv1a_64(const VALUE str);
+static inline void bs_instrumentation(VALUE event, VALUE path);
+static int bs_storage_to_output(VALUE handler, VALUE args, VALUE storage_data, VALUE * output_data);
 
 /* Helpers */
 enum cache_status {
@@ -131,6 +182,7 @@ static int update_cache_key(struct bs_cache_key *current_key, struct bs_cache_ke
 
 static void bs_cache_key_digest(struct bs_cache_key * key, const VALUE input_data);
 static VALUE bs_fetch(char * path, VALUE path_v, char * cache_path, VALUE handler, VALUE args);
+static VALUE bs_fetch_immutable(char * path, VALUE path_v, char * cache_path, VALUE handler, VALUE args);
 static VALUE bs_precompile(char * path, VALUE path_v, char * cache_path, VALUE handler);
 static int open_current_file(const char * path, struct bs_cache_key * key, const char ** errno_provenance);
 static int fetch_cached_data(int fd, ssize_t data_size, VALUE handler, VALUE args, VALUE * output_data, int * exception_tag, const char ** errno_provenance);
@@ -267,6 +319,156 @@ bs_rb_scan_dir(VALUE self, VALUE abspath)
  * Ruby C extensions are initialized by calling Init_<extname>.
  *
  * This sets up the module hierarchy and attaches functions as methods.
+/* ======= Immutable Pack Implementation ======= */
+#ifndef _WIN32
+
+static const rb_data_type_t bs_pack_type = {
+  "Bootsnap::ImmutablePack",
+  { NULL, bs_pack_free, bs_pack_memsize },
+  NULL, NULL, RUBY_TYPED_FREE_IMMEDIATELY
+};
+
+static void
+bs_pack_free(void *ptr)
+{
+  struct bs_immutable_pack *pack = ptr;
+  if (pack->mapped && pack->mapped != MAP_FAILED) {
+    munmap(pack->mapped, pack->mapped_size);
+  }
+  xfree(pack);
+}
+
+static size_t
+bs_pack_memsize(const void *ptr)
+{
+  return sizeof(struct bs_immutable_pack);
+}
+
+/*
+ * Binary search the sorted pack index for a path hash.
+ * Returns pointer to matching entry, or NULL on miss.
+ */
+static const struct bs_pack_entry *
+bs_pack_lookup(const struct bs_immutable_pack *pack, uint64_t path_hash)
+{
+  uint32_t lo = 0, hi = pack->entry_count;
+  while (lo < hi) {
+    uint32_t mid = lo + (hi - lo) / 2;
+    uint64_t mid_hash = pack->index[mid].path_hash;
+    if (mid_hash < path_hash)      lo = mid + 1;
+    else if (mid_hash > path_hash) hi = mid;
+    else                           return &pack->index[mid];
+  }
+  return NULL;
+}
+
+/*
+ * Bootsnap::CompileCache::Native.load_immutable_pack(path) -> pack or nil
+ *
+ * Memory-maps a pack file and validates its header against the current Ruby
+ * runtime. Returns an opaque pack object for use with fetch_from_immutable_pack,
+ * or nil if the file can't be loaded or the header doesn't match.
+ */
+static VALUE
+bs_rb_load_immutable_pack(VALUE self, VALUE path_v)
+{
+  Check_Type(path_v, T_STRING);
+  const char *path = RSTRING_PTR(path_v);
+
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return Qnil;
+
+  struct stat st;
+  if (fstat(fd, &st) < 0) { close(fd); return Qnil; }
+
+  size_t file_size = (size_t)st.st_size;
+  if (file_size < sizeof(struct bs_pack_header)) { close(fd); return Qnil; }
+
+  void *mapped = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (mapped == MAP_FAILED) return Qnil;
+
+  const struct bs_pack_header *hdr = (const struct bs_pack_header *)mapped;
+
+  /* Validate magic and format version */
+  if (memcmp(hdr->magic, IMMUTABLE_PACK_MAGIC, 4) != 0 ||
+      hdr->format_version != IMMUTABLE_PACK_FORMAT) {
+    munmap(mapped, file_size);
+    return Qnil;
+  }
+
+  /* Validate size: header + index must fit in file */
+  size_t index_end = sizeof(struct bs_pack_header) +
+                     (size_t)hdr->entry_count * sizeof(struct bs_pack_entry);
+  if (index_end > file_size) {
+    munmap(mapped, file_size);
+    return Qnil;
+  }
+
+  struct bs_immutable_pack *pack;
+  pack = ALLOC(struct bs_immutable_pack);
+  pack->mapped      = mapped;
+  pack->mapped_size = file_size;
+  pack->header      = hdr;
+  pack->index       = (const struct bs_pack_entry *)((const char *)mapped + sizeof(struct bs_pack_header));
+  pack->entry_count = hdr->entry_count;
+  pack->valid       = (hdr->ruby_platform  == current_ruby_platform &&
+                       hdr->compile_option  == current_compile_option_crc32 &&
+                       hdr->ruby_revision   == current_ruby_revision);
+
+  return TypedData_Wrap_Struct(rb_cBootsnap_ImmutablePack, &bs_pack_type, pack);
+}
+
+/*
+ * Bootsnap::CompileCache::Native.fetch_from_immutable_pack(pack, path, handler, args)
+ *
+ * Look up a source path in the mmap'd pack. On hit, calls handler.storage_to_output
+ * and returns the result. Returns nil on miss (caller should fall back to file cache).
+ */
+static VALUE
+bs_rb_fetch_from_immutable_pack(VALUE self, VALUE pack_v, VALUE path_v, VALUE handler, VALUE args)
+{
+  struct bs_immutable_pack *pack;
+  TypedData_Get_Struct(pack_v, struct bs_immutable_pack, &bs_pack_type, pack);
+
+  if (!pack->valid) return Qnil;
+
+  FilePathValue(path_v);
+  uint64_t path_hash = fnv1a_64(path_v);
+  const struct bs_pack_entry *entry = bs_pack_lookup(pack, path_hash);
+  if (!entry) return Qnil;
+
+  /* Bounds check */
+  if (entry->data_offset + entry->data_size > pack->mapped_size) return Qnil;
+
+  /* Create a Ruby String from the mmap'd data (copies the bytes) */
+  VALUE storage_data = rb_str_new(
+    (const char *)pack->mapped + entry->data_offset,
+    (long)entry->data_size
+  );
+
+  /* Call handler.storage_to_output(data, args) */
+  VALUE output_data;
+  int state = bs_storage_to_output(handler, args, storage_data, &output_data);
+
+  if (state != 0) {
+    /* storage_to_output raised — don't report :hit, propagate the exception */
+    rb_jump_tag(state);
+  }
+
+  if (NIL_P(output_data) || output_data == rb_cBootsnap_CompileCache_UNCOMPILABLE) {
+    return Qnil;
+  }
+
+  if (instrumentation_enabled) {
+    bs_instrumentation(sym_hit, path_v);
+  }
+  return output_data;
+}
+#endif /* !_WIN32 */
+
+/*
+ * Ruby C extensions are initialized by calling Init_<extname>.
  *
  * We also populate some semi-static information about the current OS and so on.
  */
@@ -286,7 +488,15 @@ Init_bootsnap(void)
 
   VALUE rb_mBootsnap_CompileCache = rb_define_module_under(rb_mBootsnap, "CompileCache");
   rb_mBootsnap_CompileCache_Native = rb_define_module_under(rb_mBootsnap_CompileCache, "Native");
-  rb_cBootsnap_CompileCache_UNCOMPILABLE = rb_const_get(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"));
+  /* Define UNCOMPILABLE if not already defined (handles early loading via from_gem) */
+  if (rb_const_defined(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"))) {
+    rb_cBootsnap_CompileCache_UNCOMPILABLE = rb_const_get(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"));
+  } else {
+    rb_cBootsnap_CompileCache_UNCOMPILABLE = rb_obj_alloc(rb_cBasicObject);
+    rb_const_set(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"), rb_cBootsnap_CompileCache_UNCOMPILABLE);
+    rb_define_method(rb_singleton_class(rb_cBootsnap_CompileCache_UNCOMPILABLE), "inspect",
+      /* reuse rb_any_to_s for a basic inspect */ rb_any_to_s, 0);
+  }
   rb_global_variable(&rb_cBootsnap_CompileCache_UNCOMPILABLE);
 
   current_ruby_revision = get_ruby_revision();
@@ -303,8 +513,17 @@ Init_bootsnap(void)
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "readonly=", bs_readonly_set, 1);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "revalidation=", bs_revalidation_set, 1);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "fetch", bs_rb_fetch, 4);
+  rb_define_module_function(rb_mBootsnap_CompileCache_Native, "fetch_immutable", bs_rb_fetch_immutable, 4);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "precompile", bs_rb_precompile, 3);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "compile_option_crc32=", bs_compile_option_crc32_set, 1);
+
+  /* Immutable pack support (not available on Windows) */
+#ifndef _WIN32
+  rb_cBootsnap_ImmutablePack = rb_define_class_under(rb_mBootsnap_CompileCache_Native, "ImmutablePack", rb_cObject);
+  rb_undef_alloc_func(rb_cBootsnap_ImmutablePack);
+  rb_define_module_function(rb_mBootsnap_CompileCache_Native, "load_immutable_pack", bs_rb_load_immutable_pack, 1);
+  rb_define_module_function(rb_mBootsnap_CompileCache_Native, "fetch_from_immutable_pack", bs_rb_fetch_from_immutable_pack, 4);
+#endif
 
   current_umask = umask(0777);
   umask(current_umask);
@@ -517,6 +736,36 @@ bs_rb_fetch(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler, VALUE arg
   bs_cache_path(cachedir, path_v, &cache_path);
 
   return bs_fetch(path, path_v, cache_path, handler, args);
+}
+
+/*
+ * Entrypoint for Bootsnap::CompileCache::Native.fetch_immutable.
+ *
+ * Like fetch, but optimized for immutable source files (e.g. /nix/store/).
+ * If a cache entry exists and its version/platform/revision/compile_option
+ * match the current runtime, the source file is never opened or stat'd.
+ * On cache miss, falls back to the normal fetch path to populate the cache.
+ */
+static VALUE
+bs_rb_fetch_immutable(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler, VALUE args)
+{
+  FilePathValue(path_v);
+
+  Check_Type(cachedir_v, T_STRING);
+  Check_Type(path_v, T_STRING);
+
+  if (RSTRING_LEN(cachedir_v) > MAX_CACHEDIR_SIZE) {
+    rb_raise(rb_eArgError, "cachedir too long");
+  }
+
+  char * cachedir = RSTRING_PTR(cachedir_v);
+  char * path     = RSTRING_PTR(path_v);
+  char cache_path[MAX_CACHEPATH_SIZE];
+
+  /* generate cache path to cache_path */
+  bs_cache_path(cachedir, path_v, &cache_path);
+
+  return bs_fetch_immutable(path, path_v, cache_path, handler, args);
 }
 
 /*
@@ -1058,6 +1307,73 @@ invalid_type_storage_data:
   __builtin_unreachable();
 
 #undef CLEANUP
+}
+
+/*
+ * Immutable-path fast fetch. For source files guaranteed to be immutable by
+ * the filesystem (e.g. /nix/store/ which is mounted read-only and
+ * content-addressed), we can skip opening and stat'ing the source file
+ * entirely when a valid cache entry exists.
+ *
+ * IMPORTANT: Callers MUST only use this for truly immutable paths. If used
+ * with mutable files, stale cache entries will be served indefinitely since
+ * no mtime/size/digest checks are performed. The immutable_cache_prefixes
+ * configuration controls which paths are treated as immutable.
+ *
+ * The cache key stores version, ruby_platform, compile_option, and
+ * ruby_revision. If those match the current runtime, the cached artifact
+ * is guaranteed correct (the source can never change, so mtime/size/digest
+ * checks are unnecessary).
+ *
+ * On cache miss, we fall back to the full bs_fetch which opens the source,
+ * compiles, and writes the cache.
+ */
+static VALUE
+bs_fetch_immutable(char * path, VALUE path_v, char * cache_path, VALUE handler, VALUE args)
+{
+  struct bs_cache_key cached_key;
+  int cache_fd, res, exception_tag = 0;
+  VALUE output_data;
+
+  /* Try to open and read the cache file */
+  const char * errno_provenance = NULL;
+  cache_fd = open_cache_file(cache_path, &cached_key, &errno_provenance);
+
+  if (cache_fd >= 0) {
+    /* Cache file exists. For immutable sources, we only need to verify that
+     * the cache was produced by a compatible Ruby runtime. We don't need to
+     * check mtime, size, or digest — the source can't change. */
+    if (cached_key.version == current_version &&
+        cached_key.ruby_platform == current_ruby_platform &&
+        cached_key.compile_option == current_compile_option_crc32 &&
+        cached_key.ruby_revision == current_ruby_revision) {
+
+      /* Cache key matches current runtime — read the cached data */
+      res = fetch_cached_data(
+        cache_fd, (ssize_t)cached_key.data_size, handler, args,
+        &output_data, &exception_tag, &errno_provenance
+      );
+      close(cache_fd);
+
+      if (exception_tag != 0) {
+        rb_jump_tag(exception_tag);
+      }
+
+      if (res >= 0 && !NIL_P(output_data) && output_data != rb_cBootsnap_CompileCache_UNCOMPILABLE) {
+        /* Fast path: cache hit without touching the source file */
+        bs_instrumentation(sym_hit, path_v);
+        return output_data;
+      }
+      /* Cache data was corrupt or unloadable — fall through to full fetch */
+    } else {
+      /* Key mismatch (e.g. Ruby upgrade) — close and fall through */
+      close(cache_fd);
+    }
+  }
+
+  /* Cache miss, stale runtime key, or corrupt data — fall back to full fetch
+   * which opens the source, compiles it, and writes the cache entry. */
+  return bs_fetch(path, path_v, cache_path, handler, args);
 }
 
 static VALUE
