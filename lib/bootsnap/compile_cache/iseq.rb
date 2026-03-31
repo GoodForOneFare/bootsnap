@@ -225,7 +225,11 @@ module Bootsnap
       #     → /nix/store/HASH/lib/ruby/gems/3.4.0/gems/json-2.19.2
       #   /nix/store/HASH/lib/ruby/gems/3.4.0/bundler/gems/rails-abc123/lib/rails.rb
       #     → /nix/store/HASH/lib/ruby/gems/3.4.0/bundler/gems/rails-abc123
-      GEM_ROOT_RE = %r{(.*?/(?:bundler/)?gems/[^/]+)(?:/.+)}.freeze
+      #
+      # The regex requires the gem directory name to contain a hyphen (name-version
+      # or name-hash), which distinguishes it from the Ruby version directory
+      # (gems/3.4.0) that appears earlier in the path.
+      GEM_ROOT_RE = %r{(.*/(?:bundler/)?gems/[^/]*-[^/]+)(?:/.+)}.freeze
 
       def self.extract_gem_root(path)
         if (m = GEM_ROOT_RE.match(path))
