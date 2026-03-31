@@ -38,6 +38,13 @@ module Bootsnap
           else
             @immutable_cache_prefixes = nil
           end
+
+          # Register at_exit hook to auto-build per-gem packs after boot.
+          # Only registered once, only if immutable prefixes are configured.
+          if @immutable_cache_prefixes && !@pack_build_registered
+            @pack_build_registered = true
+            at_exit { Bootsnap::CompileCache::ISeq.build_pending_gem_packs }
+          end
         end
 
         # Resolve the cache directory for a given source path.
@@ -129,8 +136,12 @@ module Bootsnap
       end
 
       # Find or lazy-load the per-gem iseq pack for a source path.
-      # Pack files live at <gem_root>/iseq.pack, co-located with the gem source.
-      # Each pack is mmap'd on first access and cached for the process lifetime.
+      # Pack files are stored in the immutable cache directory (writable),
+      # keyed by the gem root's fnv1a hash. Each pack is mmap'd on first
+      # access and cached for the process lifetime.
+      #
+      # Gems that are loaded without a pack are tracked in @gems_needing_packs
+      # so that packs can be auto-built after boot completes.
       #
       # @param path [String] absolute source file path
       # @return [ImmutablePack, nil] pack object or nil if no pack exists
@@ -141,13 +152,66 @@ module Bootsnap
         return nil unless gem_root
 
         unless @gem_packs.key?(gem_root)
-          pack_path = "#{gem_root}/iseq.pack"
-          @gem_packs[gem_root] = if Bootsnap::CompileCache::Native.respond_to?(:load_immutable_pack) && File.exist?(pack_path)
-            Bootsnap::CompileCache::Native.load_immutable_pack(pack_path)
+          pack_path = gem_pack_path(gem_root)
+          if pack_path && Bootsnap::CompileCache::Native.respond_to?(:load_immutable_pack) && File.exist?(pack_path)
+            @gem_packs[gem_root] = Bootsnap::CompileCache::Native.load_immutable_pack(pack_path)
+          else
+            @gem_packs[gem_root] = nil
+            (@gems_needing_packs ||= Set.new) << gem_root
           end
         end
 
         @gem_packs[gem_root]
+      end
+
+      # Compute the pack file path for a gem root. The pack lives in the
+      # immutable cache directory (which is writable), not in the gem root
+      # (which may be read-only, e.g. /nix/store/).
+      # Returns nil if the gem isn't under an immutable prefix.
+      def self.gem_pack_path(gem_root)
+        cache_dir, immutable = ISeq.cache_dir_for("#{gem_root}/lib/x.rb")
+        return nil unless immutable
+        require "bootsnap/compile_cache/immutable_pack"
+        h = Bootsnap::CompileCache::ImmutablePack.send(:fnv1a_64, gem_root)
+        "#{cache_dir}/packs/%016x.pack" % h
+      end
+
+      # Auto-build per-gem packs for immutable gems that were loaded without one.
+      # Call this after boot completes. Individual cache files (written during
+      # first boot) are consolidated into per-gem packs. On next boot, the packs
+      # are mmap'd and individual files are never opened.
+      #
+      # @return [Integer] number of packs built
+      def self.build_pending_gem_packs
+        return 0 unless @gems_needing_packs&.any?
+        return 0 unless @immutable_cache_prefixes
+
+        require "bootsnap/compile_cache/immutable_pack"
+        require "fileutils"
+
+        built = 0
+        @gems_needing_packs.each do |gem_root|
+          cache_dir, immutable = ISeq.cache_dir_for("#{gem_root}/lib/x.rb")
+          next unless immutable
+
+          pack_path = gem_pack_path(gem_root)
+          next unless pack_path
+
+          FileUtils.mkdir_p(File.dirname(pack_path))
+
+          source_paths = Dir.glob("#{gem_root}/**/*.rb").sort
+          next if source_paths.empty?
+
+          count = Bootsnap::CompileCache::ImmutablePack.build(
+            source_paths: source_paths,
+            cache_dir: cache_dir,
+            output_path: pack_path,
+          )
+          built += 1 if count > 0
+        end
+
+        @gems_needing_packs.clear
+        built
       end
 
       # Extract the gem root directory from an absolute source file path.
