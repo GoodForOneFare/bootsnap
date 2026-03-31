@@ -61,6 +61,11 @@ module Bootsnap
 
       @cache_dir = "#{cache_dir}/bootsnap"
 
+      # Fall back to env var if immutable_cache_prefixes not passed explicitly
+      if immutable_cache_prefixes.nil? && ENV.key?("BOOTSNAP_IMMUTABLE_CACHE_PREFIXES")
+        immutable_cache_prefixes = parse_immutable_cache_prefixes(ENV["BOOTSNAP_IMMUTABLE_CACHE_PREFIXES"])
+      end
+
       if load_path_cache
         Bootsnap::LoadPathCache.setup(
           cache_path: "#{@cache_dir}/load-path-cache",
