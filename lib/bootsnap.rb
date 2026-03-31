@@ -84,6 +84,24 @@ module Bootsnap
       LoadPathCache.unload!
     end
 
+    # Build per-gem iseq packs for any immutable gems that were loaded
+    # without an existing pack. Call this after boot completes so that
+    # the next boot benefits from mmap'd packs instead of per-file I/O.
+    #
+    # In a Rails app, call from an after_initialize block:
+    #   Rails.application.config.after_initialize do
+    #     Bootsnap.build_immutable_packs
+    #   end
+    #
+    # Or from config/initializers/bootsnap.rb:
+    #   Bootsnap.build_immutable_packs
+    #
+    # This is a no-op if no immutable cache prefixes are configured or
+    # if all gems already have packs.
+    def build_immutable_packs
+      Bootsnap::CompileCache::ISeq.build_pending_gem_packs
+    end
+
     def default_setup
       env = ENV["RAILS_ENV"] || ENV["RACK_ENV"] || ENV["ENV"]
       development_mode = ["", nil, "development"].include?(env)

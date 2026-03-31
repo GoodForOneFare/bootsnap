@@ -39,12 +39,7 @@ module Bootsnap
             @immutable_cache_prefixes = nil
           end
 
-          # Register at_exit hook to auto-build per-gem packs after boot.
-          # Only registered once, only if immutable prefixes are configured.
-          if @immutable_cache_prefixes && !@pack_build_registered
-            @pack_build_registered = true
-            at_exit { Bootsnap::CompileCache::ISeq.build_pending_gem_packs }
-          end
+
         end
 
         # Resolve the cache directory for a given source path.
