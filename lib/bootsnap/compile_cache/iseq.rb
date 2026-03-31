@@ -7,10 +7,48 @@ module Bootsnap
   module CompileCache
     module ISeq
       class << self
-        attr_reader(:cache_dir)
+        attr_reader(:cache_dir, :immutable_cache_prefixes)
 
         def cache_dir=(cache_dir)
           @cache_dir = cache_dir.end_with?("/") ? "#{cache_dir}iseq" : "#{cache_dir}-iseq"
+        end
+
+        # Set immutable cache prefixes. Each entry maps a path prefix to a shared
+        # cache directory. Files under a matching prefix are treated as
+        # **immutable**: bootsnap will skip opening and stat'ing the source
+        # file on cache hit, trusting the cache unconditionally.
+        #
+        # WARNING: Only use this for paths that are truly immutable at the
+        # filesystem level (e.g. /nix/store/ which is mounted read-only and
+        # content-addressed). If used with mutable paths, stale compiled code
+        # will be served indefinitely with no way to detect the change.
+        #
+        # @param prefixes [Hash{String => String}, nil] e.g. {"/nix/store/" => "/home/user/.cache/bootsnap/nix"}
+        def immutable_cache_prefixes=(prefixes)
+          if prefixes && !prefixes.empty?
+            # Sort by prefix length descending so longest match wins
+            @immutable_cache_prefixes = prefixes.sort_by { |k, _| -k.length }.map do |prefix, dir|
+              prefix = File.expand_path(prefix)
+              prefix = "#{prefix}/" unless prefix.end_with?("/")
+              dir = File.expand_path(dir)
+              cache = dir.end_with?("/") ? "#{dir}iseq" : "#{dir}/iseq"
+              [prefix.freeze, cache.freeze]
+            end.freeze
+          else
+            @immutable_cache_prefixes = nil
+          end
+        end
+
+        # Resolve the cache directory for a given source path.
+        # Returns [cache_dir, immutable] where immutable is true if the path
+        # matches an immutable cache prefix (indicating the source is immutable).
+        def cache_dir_for(path)
+          if @immutable_cache_prefixes
+            @immutable_cache_prefixes.each do |prefix, dir|
+              return [dir, true] if path.start_with?(prefix)
+            end
+          end
+          [@cache_dir, false]
         end
 
         def supported?
@@ -63,18 +101,33 @@ module Bootsnap
       end
 
       def self.fetch(path, cache_dir: ISeq.cache_dir)
-        Bootsnap::CompileCache::Native.fetch(
-          cache_dir,
-          path.to_s,
-          Bootsnap::CompileCache::ISeq,
-          nil,
-        )
+        path = path.to_s
+        resolved_cache_dir, immutable = cache_dir_for(path)
+        resolved_cache_dir = cache_dir unless immutable
+
+        if immutable
+          Bootsnap::CompileCache::Native.fetch_immutable(
+            resolved_cache_dir,
+            path,
+            Bootsnap::CompileCache::ISeq,
+            nil,
+          )
+        else
+          Bootsnap::CompileCache::Native.fetch(
+            resolved_cache_dir,
+            path,
+            Bootsnap::CompileCache::ISeq,
+            nil,
+          )
+        end
       end
 
       def self.precompile(path)
+        path = path.to_s
+        cache_dir, _immutable = ISeq.cache_dir_for(path)
         Bootsnap::CompileCache::Native.precompile(
           cache_dir,
-          path.to_s,
+          path,
           Bootsnap::CompileCache::ISeq,
         )
       end
@@ -109,8 +162,9 @@ module Bootsnap
       end
       compile_option_updated if supported?
 
-      def self.install!(cache_dir)
+      def self.install!(cache_dir, immutable_cache_prefixes: nil)
         Bootsnap::CompileCache::ISeq.cache_dir = cache_dir
+        Bootsnap::CompileCache::ISeq.immutable_cache_prefixes = immutable_cache_prefixes
 
         return unless supported?
 

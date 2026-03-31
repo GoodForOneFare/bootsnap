@@ -52,13 +52,19 @@ module Bootsnap
       revalidation: false,
       compile_cache_iseq: true,
       compile_cache_yaml: true,
-      compile_cache_json: (compile_cache_json_unset = true)
+      compile_cache_json: (compile_cache_json_unset = true),
+      immutable_cache_prefixes: nil
     )
       unless compile_cache_json_unset
         warn("Bootsnap.setup `compile_cache_json` argument is deprecated and has no effect")
       end
 
       @cache_dir = "#{cache_dir}/bootsnap"
+
+      # Fall back to env var if immutable_cache_prefixes not passed explicitly
+      if immutable_cache_prefixes.nil? && ENV.key?("BOOTSNAP_IMMUTABLE_CACHE_PREFIXES")
+        immutable_cache_prefixes = parse_immutable_cache_prefixes(ENV["BOOTSNAP_IMMUTABLE_CACHE_PREFIXES"])
+      end
 
       if load_path_cache
         Bootsnap::LoadPathCache.setup(
@@ -75,11 +81,20 @@ module Bootsnap
         yaml: compile_cache_yaml,
         readonly: readonly,
         revalidation: revalidation,
+        immutable_cache_prefixes: immutable_cache_prefixes,
       )
     end
 
     def unload_cache!
       LoadPathCache.unload!
+    end
+
+    # Retained as a compatibility no-op.
+    #
+    # Immutable compile cache prefixes now use shared per-file cache entries
+    # only; no post-boot pack building step is required.
+    def build_immutable_packs
+      0
     end
 
     def default_setup
@@ -112,6 +127,10 @@ module Bootsnap
           ENV["BOOTSNAP_IGNORE_DIRECTORIES"].split(",")
         end
 
+        immutable_cache_prefixes = if ENV.key?("BOOTSNAP_IMMUTABLE_CACHE_PREFIXES")
+          parse_immutable_cache_prefixes(ENV["BOOTSNAP_IMMUTABLE_CACHE_PREFIXES"])
+        end
+
         setup(
           cache_dir: cache_dir,
           development_mode: development_mode,
@@ -121,6 +140,7 @@ module Bootsnap
           readonly: bool_env("BOOTSNAP_READONLY"),
           revalidation: bool_env("BOOTSNAP_REVALIDATE"),
           ignore_directories: ignore_directories,
+          immutable_cache_prefixes: immutable_cache_prefixes,
         )
 
         if ENV["BOOTSNAP_LOG"]
@@ -161,6 +181,26 @@ module Bootsnap
     def bool_env(key, default: false)
       value = ENV.fetch(key) { default }
       !["0", "false", false].include?(value)
+    end
+
+    # Parse "prefix=cache_dir;prefix2=cache_dir2" into a hash.
+    # Example: "/nix/store/=$HOME/.cache/bootsnap/nix"
+    #
+    # Paths under these prefixes are treated as IMMUTABLE — bootsnap will
+    # skip stat'ing source files on cache hit. Only use for paths where
+    # the filesystem guarantees immutability (e.g. /nix/store/).
+    def parse_immutable_cache_prefixes(value)
+      prefixes = {}
+      value.split(";").each do |entry|
+        entry = entry.strip
+        next if entry.empty?
+
+        path_prefix, cache_path = entry.split("=", 2)
+        if path_prefix && cache_path && !path_prefix.empty? && !cache_path.empty?
+          prefixes[File.expand_path(path_prefix)] = File.expand_path(cache_path)
+        end
+      end
+      prefixes.empty? ? nil : prefixes
     end
   end
 end

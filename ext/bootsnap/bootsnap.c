@@ -115,7 +115,13 @@ static VALUE bs_readonly_set(VALUE self, VALUE enabled);
 static VALUE bs_revalidation_set(VALUE self, VALUE enabled);
 static VALUE bs_compile_option_crc32_set(VALUE self, VALUE crc32_v);
 static VALUE bs_rb_fetch(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler, VALUE args);
+static VALUE bs_rb_fetch_immutable(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler, VALUE args);
 static VALUE bs_rb_precompile(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler);
+
+/* Forward declarations needed by immutable fetch implementation */
+static uint64_t fnv1a_64(const VALUE str);
+static inline void bs_instrumentation(VALUE event, VALUE path);
+static int bs_storage_to_output(VALUE handler, VALUE args, VALUE storage_data, VALUE * output_data);
 
 /* Helpers */
 enum cache_status {
@@ -131,6 +137,7 @@ static int update_cache_key(struct bs_cache_key *current_key, struct bs_cache_ke
 
 static void bs_cache_key_digest(struct bs_cache_key * key, const VALUE input_data);
 static VALUE bs_fetch(char * path, VALUE path_v, char * cache_path, VALUE handler, VALUE args);
+static VALUE bs_fetch_immutable(char * path, VALUE path_v, char * cache_path, VALUE handler, VALUE args);
 static VALUE bs_precompile(char * path, VALUE path_v, char * cache_path, VALUE handler);
 static int open_current_file(const char * path, struct bs_cache_key * key, const char ** errno_provenance);
 static int fetch_cached_data(int fd, ssize_t data_size, VALUE handler, VALUE args, VALUE * output_data, int * exception_tag, const char ** errno_provenance);
@@ -266,10 +273,14 @@ bs_rb_scan_dir(VALUE self, VALUE abspath)
 /*
  * Ruby C extensions are initialized by calling Init_<extname>.
  *
- * This sets up the module hierarchy and attaches functions as methods.
- *
  * We also populate some semi-static information about the current OS and so on.
  */
+static VALUE
+bs_uncompilable_inspect(VALUE self)
+{
+    return rb_str_new_literal("<Bootsnap::CompileCache::UNCOMPILABLE>");
+}
+
 void
 Init_bootsnap(void)
 {
@@ -286,7 +297,15 @@ Init_bootsnap(void)
 
   VALUE rb_mBootsnap_CompileCache = rb_define_module_under(rb_mBootsnap, "CompileCache");
   rb_mBootsnap_CompileCache_Native = rb_define_module_under(rb_mBootsnap_CompileCache, "Native");
-  rb_cBootsnap_CompileCache_UNCOMPILABLE = rb_const_get(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"));
+  /* Define UNCOMPILABLE if not already defined (handles early loading via from_gem) */
+  if (rb_const_defined(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"))) {
+    rb_cBootsnap_CompileCache_UNCOMPILABLE = rb_const_get(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"));
+  } else {
+    rb_cBootsnap_CompileCache_UNCOMPILABLE = rb_obj_alloc(rb_cBasicObject);
+    rb_const_set(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"), rb_cBootsnap_CompileCache_UNCOMPILABLE);
+    rb_define_method(rb_singleton_class(rb_cBootsnap_CompileCache_UNCOMPILABLE), "inspect",
+      bs_uncompilable_inspect, 0);
+  }
   rb_global_variable(&rb_cBootsnap_CompileCache_UNCOMPILABLE);
 
   current_ruby_revision = get_ruby_revision();
@@ -303,6 +322,7 @@ Init_bootsnap(void)
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "readonly=", bs_readonly_set, 1);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "revalidation=", bs_revalidation_set, 1);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "fetch", bs_rb_fetch, 4);
+  rb_define_module_function(rb_mBootsnap_CompileCache_Native, "fetch_immutable", bs_rb_fetch_immutable, 4);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "precompile", bs_rb_precompile, 3);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "compile_option_crc32=", bs_compile_option_crc32_set, 1);
 
@@ -517,6 +537,36 @@ bs_rb_fetch(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler, VALUE arg
   bs_cache_path(cachedir, path_v, &cache_path);
 
   return bs_fetch(path, path_v, cache_path, handler, args);
+}
+
+/*
+ * Entrypoint for Bootsnap::CompileCache::Native.fetch_immutable.
+ *
+ * Like fetch, but optimized for immutable source files (e.g. /nix/store/).
+ * If a cache entry exists and its version/platform/revision/compile_option
+ * match the current runtime, the source file is never opened or stat'd.
+ * On cache miss, falls back to the normal fetch path to populate the cache.
+ */
+static VALUE
+bs_rb_fetch_immutable(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE handler, VALUE args)
+{
+  FilePathValue(path_v);
+
+  Check_Type(cachedir_v, T_STRING);
+  Check_Type(path_v, T_STRING);
+
+  if (RSTRING_LEN(cachedir_v) > MAX_CACHEDIR_SIZE) {
+    rb_raise(rb_eArgError, "cachedir too long");
+  }
+
+  char * cachedir = RSTRING_PTR(cachedir_v);
+  char * path     = RSTRING_PTR(path_v);
+  char cache_path[MAX_CACHEPATH_SIZE];
+
+  /* generate cache path to cache_path */
+  bs_cache_path(cachedir, path_v, &cache_path);
+
+  return bs_fetch_immutable(path, path_v, cache_path, handler, args);
 }
 
 /*
@@ -1058,6 +1108,73 @@ invalid_type_storage_data:
   __builtin_unreachable();
 
 #undef CLEANUP
+}
+
+/*
+ * Immutable-path fast fetch. For source files guaranteed to be immutable by
+ * the filesystem (e.g. /nix/store/ which is mounted read-only and
+ * content-addressed), we can skip opening and stat'ing the source file
+ * entirely when a valid cache entry exists.
+ *
+ * IMPORTANT: Callers MUST only use this for truly immutable paths. If used
+ * with mutable files, stale cache entries will be served indefinitely since
+ * no mtime/size/digest checks are performed. The immutable_cache_prefixes
+ * configuration controls which paths are treated as immutable.
+ *
+ * The cache key stores version, ruby_platform, compile_option, and
+ * ruby_revision. If those match the current runtime, the cached artifact
+ * is guaranteed correct (the source can never change, so mtime/size/digest
+ * checks are unnecessary).
+ *
+ * On cache miss, we fall back to the full bs_fetch which opens the source,
+ * compiles, and writes the cache.
+ */
+static VALUE
+bs_fetch_immutable(char * path, VALUE path_v, char * cache_path, VALUE handler, VALUE args)
+{
+  struct bs_cache_key cached_key;
+  int cache_fd, res, exception_tag = 0;
+  VALUE output_data;
+
+  /* Try to open and read the cache file */
+  const char * errno_provenance = NULL;
+  cache_fd = open_cache_file(cache_path, &cached_key, &errno_provenance);
+
+  if (cache_fd >= 0) {
+    /* Cache file exists. For immutable sources, we only need to verify that
+     * the cache was produced by a compatible Ruby runtime. We don't need to
+     * check mtime, size, or digest — the source can't change. */
+    if (cached_key.version == current_version &&
+        cached_key.ruby_platform == current_ruby_platform &&
+        cached_key.compile_option == current_compile_option_crc32 &&
+        cached_key.ruby_revision == current_ruby_revision) {
+
+      /* Cache key matches current runtime — read the cached data */
+      res = fetch_cached_data(
+        cache_fd, (ssize_t)cached_key.data_size, handler, args,
+        &output_data, &exception_tag, &errno_provenance
+      );
+      close(cache_fd);
+
+      if (exception_tag != 0) {
+        rb_jump_tag(exception_tag);
+      }
+
+      if (res >= 0 && !NIL_P(output_data) && output_data != rb_cBootsnap_CompileCache_UNCOMPILABLE) {
+        /* Fast path: cache hit without touching the source file */
+        bs_instrumentation(sym_hit, path_v);
+        return output_data;
+      }
+      /* Cache data was corrupt or unloadable — fall through to full fetch */
+    } else {
+      /* Key mismatch (e.g. Ruby upgrade) — close and fall through */
+      close(cache_fd);
+    }
+  }
+
+  /* Cache miss, stale runtime key, or corrupt data — fall back to full fetch
+   * which opens the source, compiles it, and writes the cache entry. */
+  return bs_fetch(path, path_v, cache_path, handler, args);
 }
 
 static VALUE
