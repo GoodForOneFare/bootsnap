@@ -181,12 +181,7 @@ module Bootsnap
 
         # Bootsnap's cache schema version (must match current_version in bootsnap.c)
         def bootsnap_cache_version
-          # Read from the C extension if available, otherwise use a sensible default
-          if Bootsnap::CompileCache::Native.respond_to?(:cache_version)
-            Bootsnap::CompileCache::Native.cache_version
-          else
-            6 # current_version as of bootsnap 1.23
-          end
+          Bootsnap::CompileCache::Native.cache_version
         end
       end
     end

@@ -126,17 +126,17 @@ static VALUE bs_rb_precompile(VALUE self, VALUE cachedir_v, VALUE path_v, VALUE 
 
 #ifndef _WIN32
 #define IMMUTABLE_PACK_MAGIC "BSPC"
-#define IMMUTABLE_PACK_FORMAT 1
+#define IMMUTABLE_PACK_FORMAT 2
 
 struct __attribute__((packed)) bs_pack_header {
   char     magic[4];         /* "BSPC" */
-  uint32_t format_version;   /* 1 */
+  uint32_t format_version;   /* 2 */
   uint32_t ruby_platform;
   uint32_t compile_option;
   uint32_t ruby_revision;
   uint32_t entry_count;
-  uint32_t reserved;         /* 0, pad to 28 bytes */
-  uint32_t reserved2;        /* 0, pad to 32 bytes */
+  uint32_t cache_version;    /* bootsnap cache schema version */
+  uint32_t reserved;         /* 0, pad to 32 bytes */
 };
 
 struct __attribute__((packed)) bs_pack_entry {
@@ -416,7 +416,7 @@ bs_rb_load_immutable_pack(VALUE self, VALUE path_v)
   if (hdr->ruby_platform  != current_ruby_platform ||
       hdr->compile_option  != current_compile_option_crc32 ||
       hdr->ruby_revision   != current_ruby_revision ||
-      (hdr->reserved != 0 && hdr->reserved != current_version)) { /* reserved[0] stores cache_version in v2 */
+      hdr->cache_version != current_version) {
     munmap(mapped, file_size);
     xfree(pack);
     return Qnil;
@@ -485,6 +485,12 @@ bs_uncompilable_inspect(VALUE self)
     return rb_str_new_literal("<Bootsnap::CompileCache::UNCOMPILABLE>");
 }
 
+static VALUE
+bs_cache_version(VALUE self)
+{
+    return UINT2NUM(current_version);
+}
+
 void
 Init_bootsnap(void)
 {
@@ -525,6 +531,7 @@ Init_bootsnap(void)
   rb_define_module_function(rb_mBootsnap, "instrumentation_enabled=", bs_instrumentation_enabled_set, 1);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "readonly=", bs_readonly_set, 1);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "revalidation=", bs_revalidation_set, 1);
+  rb_define_module_function(rb_mBootsnap_CompileCache_Native, "cache_version", bs_cache_version, 0);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "fetch", bs_rb_fetch, 4);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "fetch_immutable", bs_rb_fetch_immutable, 4);
   rb_define_module_function(rb_mBootsnap_CompileCache_Native, "precompile", bs_rb_precompile, 3);
