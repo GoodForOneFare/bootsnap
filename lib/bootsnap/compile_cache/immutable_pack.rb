@@ -33,6 +33,21 @@ module Bootsnap
       CACHE_KEY_SIZE = 64
 
       class << self
+        # Build a per-gem pack from precompiled cache files.
+        # Scans the gem directory for .rb files, ensures they're precompiled,
+        # and writes a pack file at <gem_dir>/iseq.pack.
+        #
+        # @param gem_dir [String] root of the gem (contains lib/, etc.)
+        # @param cache_dir [String] the iseq cache directory with individual files
+        # @return [Integer] number of entries in the pack
+        def build_for_gem(gem_dir:, cache_dir:)
+          source_paths = Dir.glob("#{gem_dir}/**/*.rb").sort
+          return 0 if source_paths.empty?
+
+          output_path = File.join(gem_dir, "iseq.pack")
+          build(source_paths: source_paths, cache_dir: cache_dir, output_path: output_path)
+        end
+
         # Build a pack file from precompiled individual cache files.
         #
         # @param source_paths [Array<String>] paths that were precompiled

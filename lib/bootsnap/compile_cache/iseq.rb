@@ -7,7 +7,7 @@ module Bootsnap
   module CompileCache
     module ISeq
       class << self
-        attr_reader(:cache_dir, :immutable_cache_prefixes, :immutable_pack)
+        attr_reader(:cache_dir, :immutable_cache_prefixes)
 
         def cache_dir=(cache_dir)
           @cache_dir = cache_dir.end_with?("/") ? "#{cache_dir}iseq" : "#{cache_dir}-iseq"
@@ -25,7 +25,7 @@ module Bootsnap
         #
         # @param prefixes [Hash{String => String}, nil] e.g. {"/nix/store/" => "/home/user/.cache/bootsnap/nix"}
         def immutable_cache_prefixes=(prefixes)
-          @immutable_pack = nil
+          @gem_packs = {}
           if prefixes && !prefixes.empty?
             # Sort by prefix length descending so longest match wins
             @immutable_cache_prefixes = prefixes.sort_by { |k, _| -k.length }.map do |prefix, dir|
@@ -35,17 +35,6 @@ module Bootsnap
               cache = dir.end_with?("/") ? "#{dir}iseq" : "#{dir}/iseq"
               [prefix.freeze, cache.freeze]
             end.freeze
-
-            # Auto-detect pack files: look for iseq.pack alongside the cache dir
-            if Bootsnap::CompileCache::Native.respond_to?(:load_immutable_pack)
-              @immutable_cache_prefixes.each do |_prefix, cache_dir|
-                pack_path = "#{cache_dir}.pack"
-                if File.exist?(pack_path)
-                  @immutable_pack = Bootsnap::CompileCache::Native.load_immutable_pack(pack_path)
-                  break if @immutable_pack
-                end
-              end
-            end
           else
             @immutable_cache_prefixes = nil
           end
@@ -115,34 +104,63 @@ module Bootsnap
       def self.fetch(path)
         path = path.to_s
 
-        # Fastest path: mmap'd pack file (single binary search, no syscalls).
-        # Only checked for paths under an immutable prefix — the pack contains
-        # no mutable entries so non-matching paths skip straight to file lookup.
-        if @immutable_pack
-          if @immutable_cache_prefixes&.any? { |prefix, _| path.start_with?(prefix) }
+        # Fast path for immutable (nix store) paths:
+        # Check for per-gem pack first, fall back to individual cache file.
+        if @immutable_cache_prefixes&.any? { |prefix, _| path.start_with?(prefix) }
+          # Try per-gem pack (mmap'd, binary search, zero per-file syscalls)
+          if (pack = gem_pack_for(path))
             result = Bootsnap::CompileCache::Native.fetch_from_immutable_pack(
-              @immutable_pack, path, Bootsnap::CompileCache::ISeq, nil
+              pack, path, Bootsnap::CompileCache::ISeq, nil
             )
             return result if result
           end
+
+          # Fallback: individual immutable cache file (skips source stat)
+          cache_dir, _ = ISeq.cache_dir_for(path)
+          return Bootsnap::CompileCache::Native.fetch_immutable(
+            cache_dir, path, Bootsnap::CompileCache::ISeq, nil,
+          )
         end
 
-        # Fast path: individual immutable cache file (skips stat of source)
-        cache_dir, immutable = ISeq.cache_dir_for(path)
-        if immutable
-          Bootsnap::CompileCache::Native.fetch_immutable(
-            cache_dir,
-            path,
-            Bootsnap::CompileCache::ISeq,
-            nil,
-          )
-        else
-          Bootsnap::CompileCache::Native.fetch(
-            cache_dir,
-            path,
-            Bootsnap::CompileCache::ISeq,
-            nil,
-          )
+        # Normal mutable path (full source stat + cache validation)
+        Bootsnap::CompileCache::Native.fetch(
+          @cache_dir, path, Bootsnap::CompileCache::ISeq, nil,
+        )
+      end
+
+      # Find or lazy-load the per-gem iseq pack for a source path.
+      # Pack files live at <gem_root>/iseq.pack, co-located with the gem source.
+      # Each pack is mmap'd on first access and cached for the process lifetime.
+      #
+      # @param path [String] absolute source file path
+      # @return [ImmutablePack, nil] pack object or nil if no pack exists
+      def self.gem_pack_for(path)
+        @gem_packs ||= {}
+
+        gem_root = extract_gem_root(path)
+        return nil unless gem_root
+
+        unless @gem_packs.key?(gem_root)
+          pack_path = "#{gem_root}/iseq.pack"
+          @gem_packs[gem_root] = if Bootsnap::CompileCache::Native.respond_to?(:load_immutable_pack) && File.exist?(pack_path)
+            Bootsnap::CompileCache::Native.load_immutable_pack(pack_path)
+          end
+        end
+
+        @gem_packs[gem_root]
+      end
+
+      # Extract the gem root directory from an absolute source file path.
+      # Handles both regular gems and bundler git gems:
+      #   /nix/store/HASH/lib/ruby/gems/3.4.0/gems/json-2.19.2/lib/json.rb
+      #     → /nix/store/HASH/lib/ruby/gems/3.4.0/gems/json-2.19.2
+      #   /nix/store/HASH/lib/ruby/gems/3.4.0/bundler/gems/rails-abc123/lib/rails.rb
+      #     → /nix/store/HASH/lib/ruby/gems/3.4.0/bundler/gems/rails-abc123
+      GEM_ROOT_RE = %r{(.*?/(?:bundler/)?gems/[^/]+)(?:/.+)}.freeze
+
+      def self.extract_gem_root(path)
+        if (m = GEM_ROOT_RE.match(path))
+          m[1]
         end
       end
 
