@@ -412,9 +412,16 @@ bs_rb_load_immutable_pack(VALUE self, VALUE path_v)
   pack->header      = hdr;
   pack->index       = (const struct bs_pack_entry *)((const char *)mapped + sizeof(struct bs_pack_header));
   pack->entry_count = hdr->entry_count;
-  pack->valid       = (hdr->ruby_platform  == current_ruby_platform &&
-                       hdr->compile_option  == current_compile_option_crc32 &&
-                       hdr->ruby_revision   == current_ruby_revision);
+  /* Validate header against current runtime (fix #2: include cache version, fix #4: return nil on mismatch) */
+  if (hdr->ruby_platform  != current_ruby_platform ||
+      hdr->compile_option  != current_compile_option_crc32 ||
+      hdr->ruby_revision   != current_ruby_revision ||
+      (hdr->reserved != 0 && hdr->reserved != current_version)) { /* reserved[0] stores cache_version in v2 */
+    munmap(mapped, file_size);
+    xfree(pack);
+    return Qnil;
+  }
+  pack->valid = true;
 
   return TypedData_Wrap_Struct(rb_cBootsnap_ImmutablePack, &bs_pack_type, pack);
 }
@@ -472,6 +479,12 @@ bs_rb_fetch_from_immutable_pack(VALUE self, VALUE pack_v, VALUE path_v, VALUE ha
  *
  * We also populate some semi-static information about the current OS and so on.
  */
+static VALUE
+bs_uncompilable_inspect(VALUE self)
+{
+    return rb_str_new_literal("<Bootsnap::CompileCache::UNCOMPILABLE>");
+}
+
 void
 Init_bootsnap(void)
 {
@@ -495,7 +508,7 @@ Init_bootsnap(void)
     rb_cBootsnap_CompileCache_UNCOMPILABLE = rb_obj_alloc(rb_cBasicObject);
     rb_const_set(rb_mBootsnap_CompileCache, rb_intern("UNCOMPILABLE"), rb_cBootsnap_CompileCache_UNCOMPILABLE);
     rb_define_method(rb_singleton_class(rb_cBootsnap_CompileCache_UNCOMPILABLE), "inspect",
-      /* reuse rb_any_to_s for a basic inspect */ rb_any_to_s, 0);
+      bs_uncompilable_inspect, 0);
   }
   rb_global_variable(&rb_cBootsnap_CompileCache_UNCOMPILABLE);
 

@@ -18,3 +18,4 @@ mkmf.log
 vendor/
 ext/bootsnap/Makefile
 ext/bootsnap/*.dSYM/
+Makefile

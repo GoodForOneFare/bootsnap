@@ -14,6 +14,12 @@ module Bootsnap
 
     Error = Class.new(StandardError)
 
+    @readonly = false
+    class << self
+      attr_reader :readonly
+      alias_method :readonly?, :readonly
+    end
+
     def self.setup(cache_dir:, iseq:, yaml:, json: (json_unset = true), readonly: false, revalidation: false, immutable_cache_prefixes: nil)
       unless json_unset
         warn("Bootsnap::CompileCache.setup `json` argument is deprecated and has no effect")
@@ -41,6 +47,7 @@ module Bootsnap
         Bootsnap::CompileCache::Native.readonly = readonly
         Bootsnap::CompileCache::Native.revalidation = revalidation
       end
+      @readonly = readonly
     end
 
     def self.supported?

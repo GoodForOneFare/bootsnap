@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "bootsnap/bootsnap"
+require "set"
 require "zlib"
 
 module Bootsnap
@@ -148,10 +149,12 @@ module Bootsnap
 
         unless @gem_packs.key?(gem_root)
           pack_path = gem_pack_path(gem_root)
-          if pack_path && Bootsnap::CompileCache::Native.respond_to?(:load_immutable_pack) && File.exist?(pack_path)
-            @gem_packs[gem_root] = Bootsnap::CompileCache::Native.load_immutable_pack(pack_path)
-          else
-            @gem_packs[gem_root] = nil
+          loaded = if pack_path && Bootsnap::CompileCache::Native.respond_to?(:load_immutable_pack) && File.exist?(pack_path)
+            Bootsnap::CompileCache::Native.load_immutable_pack(pack_path)
+          end
+          @gem_packs[gem_root] = loaded
+          # Queue for rebuild if no pack or pack was invalid (returned nil)
+          unless loaded
             (@gems_needing_packs ||= Set.new) << gem_root
           end
         end
@@ -177,9 +180,11 @@ module Bootsnap
       # are mmap'd and individual files are never opened.
       #
       # @return [Integer] number of packs built
+      # @return [Integer] number of packs built
       def self.build_pending_gem_packs
         return 0 unless @gems_needing_packs&.any?
         return 0 unless @immutable_cache_prefixes
+        return 0 if Bootsnap::CompileCache.readonly?
 
         require "bootsnap/compile_cache/immutable_pack"
         require "fileutils"
@@ -192,17 +197,22 @@ module Bootsnap
           pack_path = gem_pack_path(gem_root)
           next unless pack_path
 
-          FileUtils.mkdir_p(File.dirname(pack_path))
+          begin
+            FileUtils.mkdir_p(File.dirname(pack_path))
 
-          source_paths = Dir.glob("#{gem_root}/**/*.rb").sort
-          next if source_paths.empty?
+            source_paths = Dir.glob("#{gem_root}/**/*.rb").sort
+            next if source_paths.empty?
 
-          count = Bootsnap::CompileCache::ImmutablePack.build(
-            source_paths: source_paths,
-            cache_dir: cache_dir,
-            output_path: pack_path,
-          )
-          built += 1 if count > 0
+            count = Bootsnap::CompileCache::ImmutablePack.build(
+              source_paths: source_paths,
+              cache_dir: cache_dir,
+              output_path: pack_path,
+            )
+            built += 1 if count > 0
+          rescue SystemCallError, IOError => e
+            # Fail-open: pack building is best-effort (fix #6)
+            $stderr.puts("[Bootsnap] warning: failed to build pack for #{gem_root}: #{e.message}") if $VERBOSE
+          end
         end
 
         @gems_needing_packs.clear
