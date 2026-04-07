@@ -207,6 +207,11 @@ module Bootsnap
 
         path_prefix, cache_path = entry.split("=", 2)
         if path_prefix && cache_path && !path_prefix.empty? && !cache_path.empty?
+          unless absolute_path?(path_prefix)
+            raise InvalidConfiguration,
+              "BOOTSNAP_IMMUTABLE_CACHE_PREFIXES prefixes must be absolute paths: #{path_prefix.inspect}"
+          end
+
           prefixes[File.expand_path(path_prefix)] = File.expand_path(cache_path)
         end
       end

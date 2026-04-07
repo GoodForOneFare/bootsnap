@@ -30,6 +30,12 @@ module Bootsnap
           if prefixes && !prefixes.empty?
             # Sort by prefix length descending so longest match wins
             @immutable_cache_prefixes = prefixes.sort_by { |k, _| -k.length }.map do |prefix, dir|
+              prefix = prefix.to_s
+              unless Bootsnap.absolute_path?(prefix)
+                raise Bootsnap::InvalidConfiguration,
+                  "immutable_cache_prefixes keys must be absolute paths: #{prefix.inspect}"
+              end
+
               prefix = File.expand_path(prefix)
               prefix = "#{prefix}/" unless prefix.end_with?("/")
               dir = File.expand_path(dir)
@@ -39,13 +45,11 @@ module Bootsnap
           else
             @immutable_cache_prefixes = nil
           end
-
-
         end
 
         # Resolve the cache directory for a given source path.
         # Returns [cache_dir, immutable] where immutable is true if the path
-        # matches a immutable cache prefix (indicating the source is immutable).
+        # matches an immutable cache prefix (indicating the source is immutable).
         def cache_dir_for(path)
           if @immutable_cache_prefixes
             @immutable_cache_prefixes.each do |prefix, dir|
@@ -104,13 +108,13 @@ module Bootsnap
         end
       end
 
-      def self.fetch(path)
+      def self.fetch(path, cache_dir: ISeq.cache_dir)
         path = path.to_s
+        immutable_cache_dir, immutable = cache_dir_for(path)
 
-        # Fast path for immutable (nix store) paths:
-        # Check for per-gem pack first, fall back to individual cache file.
-        if @immutable_cache_prefixes&.any? { |prefix, _| path.start_with?(prefix) }
-          # Try per-gem pack (mmap'd, binary search, zero per-file syscalls)
+        if immutable
+          # Fast path for immutable (nix store) paths:
+          # try per-gem pack first, then fall back to the individual cache file.
           if (pack = gem_pack_for(path))
             result = Bootsnap::CompileCache::Native.fetch_from_immutable_pack(
               pack, path, Bootsnap::CompileCache::ISeq, nil
@@ -118,16 +122,14 @@ module Bootsnap
             return result if result
           end
 
-          # Fallback: individual immutable cache file (skips source stat)
-          cache_dir, _ = ISeq.cache_dir_for(path)
           return Bootsnap::CompileCache::Native.fetch_immutable(
-            cache_dir, path, Bootsnap::CompileCache::ISeq, nil,
+            immutable_cache_dir, path, Bootsnap::CompileCache::ISeq, nil,
           )
         end
 
         # Normal mutable path (full source stat + cache validation)
         Bootsnap::CompileCache::Native.fetch(
-          @cache_dir, path, Bootsnap::CompileCache::ISeq, nil,
+          cache_dir, path, Bootsnap::CompileCache::ISeq, nil,
         )
       end
 
@@ -239,9 +241,9 @@ module Bootsnap
 
       def self.precompile(path)
         path = path.to_s
-        cache_dir, _immutable = ISeq.cache_dir_for(path)
+        resolved_cache_dir, _immutable = ISeq.cache_dir_for(path)
         Bootsnap::CompileCache::Native.precompile(
-          cache_dir,
+          resolved_cache_dir,
           path,
           Bootsnap::CompileCache::ISeq,
         )
