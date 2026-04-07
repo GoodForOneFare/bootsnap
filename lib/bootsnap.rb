@@ -89,13 +89,6 @@ module Bootsnap
       LoadPathCache.unload!
     end
 
-    # Retained as a compatibility no-op.
-    #
-    # Immutable compile cache prefixes now use shared per-file cache entries
-    # only; no post-boot pack building step is required.
-    def build_immutable_packs
-      0
-    end
 
     def default_setup
       env = ENV["RAILS_ENV"] || ENV["RACK_ENV"] || ENV["ENV"]
@@ -197,6 +190,11 @@ module Bootsnap
 
         path_prefix, cache_path = entry.split("=", 2)
         if path_prefix && cache_path && !path_prefix.empty? && !cache_path.empty?
+          unless absolute_path?(path_prefix)
+            raise InvalidConfiguration,
+              "BOOTSNAP_IMMUTABLE_CACHE_PREFIXES prefixes must be absolute paths: #{path_prefix.inspect}"
+          end
+
           prefixes[File.expand_path(path_prefix)] = File.expand_path(cache_path)
         end
       end

@@ -30,6 +30,12 @@ module Bootsnap
         def immutable_cache_prefixes=(prefixes)
           if prefixes && !prefixes.empty?
             @immutable_cache_prefixes = prefixes.sort_by { |k, _| -k.length }.map do |prefix, dir|
+              prefix = prefix.to_s
+              unless Bootsnap.absolute_path?(prefix)
+                raise Bootsnap::InvalidConfiguration,
+                  "immutable_cache_prefixes keys must be absolute paths: #{prefix.inspect}"
+              end
+
               prefix = File.expand_path(prefix)
               prefix = "#{prefix}/" unless prefix.end_with?("/")
               dir = File.expand_path(dir)

@@ -28,6 +28,12 @@ module Bootsnap
           if prefixes && !prefixes.empty?
             # Sort by prefix length descending so longest match wins
             @immutable_cache_prefixes = prefixes.sort_by { |k, _| -k.length }.map do |prefix, dir|
+              prefix = prefix.to_s
+              unless Bootsnap.absolute_path?(prefix)
+                raise Bootsnap::InvalidConfiguration,
+                  "immutable_cache_prefixes keys must be absolute paths: #{prefix.inspect}"
+              end
+
               prefix = File.expand_path(prefix)
               prefix = "#{prefix}/" unless prefix.end_with?("/")
               dir = File.expand_path(dir)
@@ -102,19 +108,18 @@ module Bootsnap
 
       def self.fetch(path, cache_dir: ISeq.cache_dir)
         path = path.to_s
-        resolved_cache_dir, immutable = cache_dir_for(path)
-        resolved_cache_dir = cache_dir unless immutable
+        immutable_cache_dir, immutable = cache_dir_for(path)
 
         if immutable
           Bootsnap::CompileCache::Native.fetch_immutable(
-            resolved_cache_dir,
+            immutable_cache_dir,
             path,
             Bootsnap::CompileCache::ISeq,
             nil,
           )
         else
           Bootsnap::CompileCache::Native.fetch(
-            resolved_cache_dir,
+            cache_dir,
             path,
             Bootsnap::CompileCache::ISeq,
             nil,
@@ -124,9 +129,9 @@ module Bootsnap
 
       def self.precompile(path)
         path = path.to_s
-        cache_dir, _immutable = ISeq.cache_dir_for(path)
+        resolved_cache_dir, _immutable = ISeq.cache_dir_for(path)
         Bootsnap::CompileCache::Native.precompile(
-          cache_dir,
+          resolved_cache_dir,
           path,
           Bootsnap::CompileCache::ISeq,
         )

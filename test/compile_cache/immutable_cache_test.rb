@@ -248,6 +248,22 @@ class ImmutableCachePrefixTest < Minitest::Test
     assert_nil Bootsnap::CompileCache::ISeq.immutable_cache_prefixes
   end
 
+  def test_immutable_cache_prefixes_require_absolute_paths
+    error = assert_raises(Bootsnap::InvalidConfiguration) do
+      Bootsnap::CompileCache::ISeq.immutable_cache_prefixes = {
+        "relative/prefix" => "/tmp/cache",
+      }
+    end
+    assert_match(/absolute paths/, error.message)
+
+    error = assert_raises(Bootsnap::InvalidConfiguration) do
+      Bootsnap::CompileCache::YAML.immutable_cache_prefixes = {
+        "relative/prefix" => "/tmp/cache",
+      }
+    end
+    assert_match(/absolute paths/, error.message)
+  end
+
   # --- YAML immutable cache tests ---
 
   def test_yaml_cache_dir_for_returns_shared_dir_for_matching_prefix
@@ -274,9 +290,6 @@ class ImmutableCachePrefixTest < Minitest::Test
     refute immutable
   end
 
-  def test_build_immutable_packs_is_a_no_op
-    assert_equal 0, Bootsnap.build_immutable_packs
-  end
 
   # --- env var parsing ---
 
@@ -304,5 +317,12 @@ class ImmutableCachePrefixTest < Minitest::Test
   def test_parse_immutable_cache_prefixes_returns_nil_for_empty
     assert_nil Bootsnap.send(:parse_immutable_cache_prefixes, "")
     assert_nil Bootsnap.send(:parse_immutable_cache_prefixes, ";;")
+  end
+
+  def test_parse_immutable_cache_prefixes_requires_absolute_paths
+    error = assert_raises(Bootsnap::InvalidConfiguration) do
+      Bootsnap.send(:parse_immutable_cache_prefixes, "relative/prefix=/tmp/cache")
+    end
+    assert_match(/absolute paths/, error.message)
   end
 end
